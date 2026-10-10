@@ -19,12 +19,15 @@ Each run of a level is a chain of up to --links generations ("links"). Every lin
 
   * The first VERIFIED candidate ends the chain: that run outputs its kernel and the next run starts.
   * Every candidate that fails leaves its error in a memory, and the next link's prompt opens with it:
-    "these attempts failed, for these reasons -- do not do that again".
+    "these attempts failed, for these reasons -- do not do that again" -- and each remembered error
+    carries its FIX (FIXES), because a small model told only what not to do repeats the same mistake.
   * A candidate whose code is the same as one that already failed (comments and spacing ignored) is
     rejected without being checked, and the next prompt says it was a repeat. Each link therefore has
     to produce DIFFERENT code.
-  * Half of a link's samples repair the best kernel so far, half start fresh with the memory, so the
-    ensemble always holds both a fix and a new attempt.
+  * One sample per link is a SIMPLIFY candidate: "the simplest correct kernel", with the NumPy
+    reference, the shape facts, the legal data path and the real API. It is the one prompt that has ever
+    solved level 3 here. The others repair the best kernel so far and start fresh with the memory, in
+    alternation, so the ensemble always holds a fix, a new attempt and a simple one.
   * Working comes first; speed second. Once a kernel is verified, --speed-links more links ask for a
     version that moves fewer HBM bytes in fewer DMA transfers. One is kept only if it is still verified
     AND moves less. "Faster" here is the simulator's traffic count, not a timing on the chip.
@@ -751,6 +754,26 @@ def card_for(level, category):
     return CARDS[CATEGORY_CARD.get(category) or level_card(level)]
 
 
+def shape_facts(level):
+    """Facts for the simplify candidate, computed from the test shapes rather than written per level."""
+    spec = nkibench.LEVELS[level]
+    lines = ["Test shapes: " + "; ".join(nkibench.label(c, level) for c in spec["shapes"]) + "."]
+    firsts = []
+    for c in spec["shapes"]:
+        args, _ = nkibench.make_inputs(c, level)
+        firsts += [x.shape[0] for x in args if isinstance(x, np.ndarray)]
+    if firsts and max(firsts) <= nkibench.PMAX:
+        lines.append(f"Every input's first dimension is at most {nkibench.PMAX}, so each input fits in "
+                     f"ONE sbuf tile: one dma_copy in, compute, one dma_copy out. No loop over "
+                     f"partitions is needed.")
+    if all("M" in c for c in spec["shapes"]):
+        exact = all(c["M"] % 128 == 0 and c["K"] % 128 == 0 and c["N"] % 512 == 0
+                    for c in spec["shapes"])
+        lines.append("Tile M by 128, N by 512, K by 128" + (
+            "; every test size is an exact multiple, so there are no partial tiles." if exact else "."))
+    return "\n".join(lines)
+
+
 # ================================================================ the verified-kernel record
 
 class Library:
@@ -864,10 +887,49 @@ def code_key(src):
     return hashlib.sha1(canon.encode()).hexdigest()[:12]
 
 
+# What to do INSTEAD, per failure category. Measured: told only "this failed, do not repeat it", the
+# model failed level 4 with k_too_big on four links running -- a small model that does not know the
+# right pattern cannot invent it from a list of its mistakes. So every remembered error carries its fix.
+# Categories whose checker feedback is already an exact instruction (rule_violation, stale_api,
+# missing_entry, import_error) have no entry: the feedback is the fix.
+FIXES = {
+    "shape_mismatch": "allocate each tile with EXACTLY the shape of the slice copied into it; dma_copy "
+                      "does not slice or broadcast",
+    "partition_limit": "a tile has at most 128 rows: loop over that dimension in chunks of 128 with "
+                       "nl.affine_range, one tile per chunk",
+    "k_too_big": "contract K in chunks of 128: allocate ONE psum tile BEFORE the k loop, nc_matmul into it "
+                 "on every k step, tensor_copy it out AFTER the loop",
+    "k_accum_reset": "allocate the psum tile once, BEFORE the k loop, and accumulate into the same tile",
+    "k_slice_static": "slice both operands with the k loop variable: lhsT[k*128:(k+1)*128, ...] and "
+                      "rhs[k*128:(k+1)*128, ...]",
+    "buffer_placement": "nc_matmul writes dst in nl.psum and reads stationary and moving from nl.sbuf; "
+                        "tensor_copy psum to sbuf before the dma_copy out",
+    "api_invented": "use only real functions: nl.ndarray, nl.affine_range, nl.sum, nisa.dma_copy, "
+                    "nisa.nc_matmul, nisa.tensor_copy, nisa.tensor_scalar, nisa.tensor_tensor",
+    "api_misuse": "pass only the arguments the function takes; the error message names its real signature",
+    "out_of_bounds": "keep every slice inside the tensor; a dimension of 128 or less is used whole, never "
+                     "padded up to 128",
+    "wrong_shape": "allocate the output in nl.shared_hbm with exactly the reference's output shape",
+    "operand_swap": "lhsT [K, M] is stationary, rhs [K, N] is moving; the result is [M, N]",
+    "unwritten_output": "dma_copy every computed tile into its slice of the output, inside the loop",
+    "input_modified": "never write into an input; allocate a new output in nl.shared_hbm and return it",
+    "python_op_on_tile": "tiles are not numbers: combine them with nisa ops (tensor_tensor, tensor_scalar), "
+                         "not + or +=",
+    "no_op": "elements must actually move: read each from its source position, write it to its destination",
+    "wrong_layout": "the values are right but in the wrong places: check which axis each loop variable indexes",
+    "wrong_scale": "the structure is right; one constant (a scale or a divide) is wrong",
+    "repeat": "change the structure of the kernel, not just names or comments",
+    "truncated": "reply with one SHORT, complete python code block and nothing else",
+    "no_code": "reply with one complete python code block and nothing else",
+    "parse": "reply with one complete python code block and nothing else",
+}
+
+
 def memory_text(fails, limit=6, head="These earlier attempts FAILED. Do not repeat any of them -- write "
                                      "something different that avoids each of these errors:"):
-    """The 'do not do that again' block. The same error from several attempts is one line with a count,
-    and only the `limit` most recent distinct errors are kept, so the block stays a few hundred tokens."""
+    """The 'do not do that again' block, with what to do instead. The same error from several attempts
+    is one line with a count, and only the `limit` most recent distinct errors are kept, so the block
+    stays a few hundred tokens."""
     if not fails:
         return ""
     groups = collections.OrderedDict()
@@ -880,7 +942,9 @@ def memory_text(fails, limit=6, head="These earlier attempts FAILED. Do not repe
     lines = []
     for f, n, tags in list(groups.values())[-limit:]:
         seen = f" (seen {n}x: {', '.join(tags[-3:])})" if n > 1 else f" ({tags[0]})"
-        lines.append(f"- {f.category}{seen}: {textwrap.shorten(f.feedback, 240)}")
+        fix = FIXES.get(f.category)
+        lines.append(f"- {f.category}{seen}: {textwrap.shorten(f.feedback, 200)}"
+                     + (f"\n  FIX: {fix}." if fix else ""))
     return head + "\n" + "\n".join(lines)
 
 
@@ -895,11 +959,19 @@ def traffic_floor(level):
 
 
 def chain_plan(link, n, have_code):
-    """Link 0, or no code yet: every sample starts fresh. After that the ensemble alternates repair of
-    the best kernel so far with a fresh attempt, so one link always holds both."""
+    """What each of a link's n samples is asked for.
+
+    The last sample is always `simplify` (with n > 1): it is the only prompt that ever solved level 3 --
+    both of the strategy ladder's level-3 solves came from it, and every fresh or repair attempt at level
+    3 failed, in agent.py, the ladder and the chain alike. The rest: link 0, or no code yet, all fresh;
+    after that, repair of the best kernel so far alternating with fresh."""
+    if n == 1:
+        return ["fresh" if link == 0 or not have_code else "repair"]
     if link == 0 or not have_code:
-        return ["fresh"] * n
-    return ["repair" if i % 2 == 0 else "fresh" for i in range(n)]
+        rest = ["fresh"] * (n - 1)
+    else:
+        rest = ["repair" if i % 2 == 0 else "fresh" for i in range(n - 1)]
+    return rest + ["simplify"]
 
 
 def chain_prompt(kind, level, a, memory, best=None, terse=0):
@@ -919,6 +991,18 @@ def chain_prompt(kind, level, a, memory, best=None, terse=0):
             S.append(("card", "Reference pattern:\n" + card_for(level, best.category), 2))
         S.append(("ask", "Fix exactly what the checker names. Your code must differ from every failed "
                          "attempt above. Reply with ONE python code block.", 0))
+    elif kind == "simplify":
+        # Positive guidance, not only a list of mistakes: what to compute (the NumPy reference), the shape
+        # facts, the legal data path and the real API -- the prompt that solved level 3 in the ladder.
+        S.append(("task", f"Write the SIMPLEST correct AWS Neuron NKI kernel for {spec['op']}. Ignore "
+                          f"speed completely; correctness is the only goal. It must compute what this "
+                          f"reference computes:\n\n{inspect.getsource(spec['ref'])}", 0))
+        S.append(("facts", shape_facts(level), 1))
+        if a.cards:
+            S.append(("card", "Reference pattern:\n" + card_for(level, best.category if best else ""), 2))
+        S.append(("api", base.API_CARD, 4))
+        S.append(("memory", mem, 3))
+        S.append(("signature", signature_line(level) + "\nReply with ONE python code block.", 0))
     elif kind == "speed":
         S.append(("task", f"This NKI kernel for {spec['op']} is CORRECT on every test shape:\n\n"
                           f"```python\n{best.source}\n```", 0))
@@ -1204,17 +1288,22 @@ def selftest():
     mt = memory_text(fails)
     check("chain: memory groups a repeated error with a count", "seen 2x" in mt and mt.count("shape_mismatch") == 1,
           mt.replace("\n", " | ")[:120])
+    check("chain: every remembered error carries its fix", mt.count("FIX:") == 2 and "exactly the shape" in mt.lower(),
+          mt.replace("\n", " | ")[-160:])
     check("chain: memory is empty when nothing has failed", memory_text([]) == "")
-    check("chain: link 0 is all fresh", chain_plan(0, 4, True) == ["fresh"] * 4)
-    check("chain: later links mix repair and fresh", set(chain_plan(1, 4, True)) == {"repair", "fresh"})
-    check("chain: no code yet stays fresh", chain_plan(3, 4, False) == ["fresh"] * 4)
+    check("chain: link 0 is fresh plus one simplify", chain_plan(0, 4, True) == ["fresh"] * 3 + ["simplify"])
+    check("chain: later links mix repair, fresh and simplify",
+          chain_plan(1, 4, True) == ["repair", "fresh", "repair", "simplify"])
+    check("chain: no code yet stays fresh, plus simplify", chain_plan(3, 4, False) == ["fresh"] * 3 + ["simplify"])
+    check("chain: one sample is fresh, then repair", chain_plan(0, 1, True) == ["fresh"]
+          and chain_plan(2, 1, True) == ["repair"])
 
     many =[Failure(f"L{i}.s{j}", str(i * 4 + j), "numerics", "x" * 400 + str(i * 4 + j))
             for i in range(5) for j in range(4)]
     good = Verdict(source=open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                             "reference_level3.py")).read(),
                    feedback="0 of 1 shapes passed", category="shape_mismatch", hbm_bytes=1234, transfers=3)
-    for kind in ("fresh", "repair", "speed"):
+    for kind in ("fresh", "repair", "simplify", "speed"):
         prompt, secs, _ = chain_prompt(kind, 3, A, many, good)
         check(f"chain: `{kind}` prompt with 20 failures fits the budget",
               sum(secs.values()) <= input_budget(A) and "memory" in secs, f"{sum(secs.values())} tok {list(secs)}")
